@@ -1,192 +1,158 @@
 import os
 import json
-import base64
+import requests
 import re
-import shutil
-from typing import Optional, Dict
+from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse
 import uvicorn
 from groq import Groq
 from dotenv import load_dotenv
 
-# ==========================================
-# 1. CẤU HÌNH & KHỞI TẠO
-# ==========================================
 load_dotenv()
 app = FastAPI()
 
-TEMP_DIR = "temp_uploads"
-os.makedirs(TEMP_DIR, exist_ok=True)
+# Cấu hình kết nối sang dịch vụ Vision
+VISION_SERVICE_URL = os.getenv("VISION_SERVICE_URL", "http://vision_service:8080/analyze")
 
-class UnifiedVisionAgent:
+class ChatAgent:
     def __init__(self):
-        self.api_key = os.getenv("GROQ_API_KEY")
-        self.client = Groq(api_key=self.api_key)
-        self.v_model = "meta-llama/llama-4-scout-17b-16e-instruct"
-        self.c_model = os.getenv("MODEL_ID", "qwen/qwen3-32b")
+        self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        self.model = os.getenv("MODEL_ID", "qwen/qwen3-32b")
 
-    def _encode_image(self, image_path: str) -> str:
-        with open(image_path, "rb") as f:
-            return base64.b64encode(f.read()).decode('utf-8')
-
-    def chat_logic(self, user_query: str, image_path: Optional[str] = None) -> str:
-        """
-        Logic ổn định: Phân tích -> Hậu xử lý -> Kết quả cuối cùng
-        """
+    def chat_logic(self, user_query: str, image_file: Optional[UploadFile] = None) -> str:
         vision_data = None
-        if image_path:
-            base64_image = self._encode_image(image_path)
-            extract_prompt = f"Phân tích ảnh và trích xuất JSON: category, detected_elements, ocr_content, visual_description, confidence. Focus: {user_query}"
-            
-            try:
-                v_res = self.client.chat.completions.create(
-                    model=self.v_model,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": extract_prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                        ]
-                    }],
-                    response_format={"type": "json_object"},
-                    temperature=0.1
-                )
-                vision_data = json.loads(v_res.choices[0].message.content)
-            except Exception as e:
-                print(f"Error Vision: {e}")
-
-        # System prompt nghiêm ngặt
-        system_instruction = f"""
-        Bạn là Qwen - Chuyên gia trợ lý ảo thông minh. 
-        NHIỆM VỤ: Trả lời câu hỏi người dùng dựa trên dữ liệu hình ảnh (nếu có).
-        QUY TẮC BẮT BUỘC:
-        1. CHỈ sử dụng Tiếng Việt 100%. Không xen kẽ tiếng Anh.
-        2. Tuyệt đối KHÔNG hiển thị các khối suy nghĩ <think>.
-        3. Sử dụng Markdown để trình bày kết quả thật đẹp và chuyên nghiệp.
-        """
         
+        # 1. Nếu có ảnh, gọi sang dịch vụ Vision (8080)
+        if image_file:
+            print(f"[AGENT] Gửi ảnh sang Vision Service: {VISION_SERVICE_URL}")
+            try:
+                files = {"image": (image_file.filename, image_file.file, image_file.content_type)}
+                data = {"prompt": user_query}
+                response = requests.post(VISION_SERVICE_URL, files=files, data=data)
+                if response.ok:
+                    vision_data = response.json()
+                else:
+                    print(f"[AGENT] Vision Service Error: {response.text}")
+            except Exception as e:
+                print(f"[AGENT] Connection Error: {e}")
+
+        # 2. Xử lý Trí tuệ (Brain Layer)
+        system_instruction = "Bạn là Qwen Assistant. Trả lời TIẾNG VIỆT 100%. Không Anh, không <think>. Trình bày Markdown đẹp."
         messages = [{"role": "system", "content": system_instruction}]
+        
         if vision_data:
-            messages.append({"role": "user", "content": f"Dữ liệu Vision chuyên sâu: {json.dumps(vision_data, ensure_ascii=False)}\nCâu hỏi người dùng: {user_query}"})
+            messages.append({"role": "user", "content": f"Dữ liệu ảnh: {json.dumps(vision_data, ensure_ascii=False)}\nCâu hỏi: {user_query}"})
         else:
             messages.append({"role": "user", "content": user_query})
 
         try:
-            completion = self.client.chat.completions.create(
-                model=self.c_model,
-                messages=messages,
-                temperature=0.6,
-                max_completion_tokens=2048
-            )
+            completion = self.client.chat.completions.create(model=self.model, messages=messages, temperature=0.6)
+            txt = completion.choices[0].message.content
+            txt = re.sub(r'<think>.*?</think>', '', txt, flags=re.DOTALL).strip()
             
-            final_text = completion.choices[0].message.content
-            # Lọc sạch <think> tags
-            final_text = re.sub(r'<think>.*?</think>', '', final_text, flags=re.DOTALL).strip()
-            
-            # Thêm Footer Độ tin cậy nếu có phân tích ảnh
             if vision_data:
                 conf = int(vision_data.get('confidence', 0) * 100)
-                final_text += f"\n\n---\n🎯 **Độ tin cậy hệ thống: {conf}%**"
-                if conf < 70:
-                    final_text += f"\n⚠️ *Lưu ý: {vision_data.get('warning', 'Kết quả này có thể cần kiểm chứng thêm.')}*"
-            
-            return final_text
-
+                txt += f"\n\n---\n🎯 **Độ tin cậy: {conf}%**"
+            return txt
         except Exception as e:
-            return f"❌ Lỗi hệ thống: {str(e)}"
+            return f"❌ Lỗi: {str(e)}"
 
-agent = UnifiedVisionAgent()
+agent = ChatAgent()
 
 # ==========================================
-# 3. GIAO DIỆN (STABLE MODE)
+# GIAO DIỆN (GIỮ NGUYÊN STYLE CHATGPT)
 # ==========================================
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
-    <title>ANTIGRAVITY IQ | STABLE</title>
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <title>Antigravity Chat Agent</title>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
-        :root { --primary: #8b5cf6; --bg: #030712; --surface: rgba(17, 24, 39, 0.85); --border: rgba(255, 255, 255, 0.1); }
-        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Plus Jakarta Sans', sans-serif; }
-        body { background: radial-gradient(circle at top left, #1e1b4b, #030712); color: #f3f4f6; height: 100vh; display: flex; justify-content: center; align-items: center; }
-        .app-container { width: 90%; max-width: 1000px; height: 85vh; background: var(--surface); backdrop-filter: blur(25px); border: 1px solid var(--border); border-radius: 28px; display: flex; flex-direction: column; box-shadow: 0 25px 50px rgba(0,0,0,0.5); }
-        .header { padding: 25px; text-align: center; border-bottom: 1px solid var(--border); }
-        .header h1 { font-size: 1.8rem; background: linear-gradient(to right, #a78bfa, #f472b6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 800; }
-        .chat-box { flex: 1; padding: 30px; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; }
-        .message { max-width: 80%; padding: 16px 22px; border-radius: 20px; font-size: 0.95rem; line-height: 1.6; animation: fadeIn 0.3s ease-out; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        .user-message { align-self: flex-end; background: #6366f1; border-bottom-right-radius: 4px; }
-        .ai-message { align-self: flex-start; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
-        .input-area { padding: 25px 35px; border-top: 1px solid var(--border); background: rgba(0,0,0,0.2); }
-        .form-container { display: flex; gap: 15px; align-items: center; }
-        .upload-trigger { width: 50px; height: 50px; background: rgba(255,255,255,0.05); border: 1px solid var(--border); border-radius: 12px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 20px; }
-        input[type="text"] { flex: 1; background: rgba(255,255,255,0.05); border: 1px solid var(--border); color: white; padding: 15px 20px; border-radius: 14px; outline: none; }
-        .send-btn { background: white; color: black; border: none; padding: 0 25px; height: 50px; border-radius: 12px; font-weight: 700; cursor: pointer; transition: transform 0.2s; }
-        .send-btn:hover { transform: scale(1.05); }
-        #preview { display: none; width: 100px; height: 70px; object-fit: cover; border-radius: 10px; margin-bottom: 10px; border: 2px solid var(--primary); }
-        .loading { display:none; color: var(--primary); font-size: 0.8rem; margin-top: 5px; }
+        :root { --sidebar-bg:#000000; --main-bg:#0a0a0a; --border:#262626; --text:#ececec; --text-dim:#9b9b9b; --primary:#3b82f6; }
+        * { margin:0; padding:0; box-sizing:border-box; font-family:'Plus Jakarta Sans', sans-serif; }
+        body { background:var(--main-bg); color:var(--text); height:100vh; display:flex; overflow:hidden; }
+        #sidebar { width:260px; height:100%; background:var(--sidebar-bg); border-right:1px solid var(--border); display:flex; flex-direction:column; padding:12px; }
+        .new-chat-btn { border:1px solid var(--border); padding:12px; border-radius:8px; cursor:pointer; margin-bottom:20px; text-align:center; font-weight:500; display:flex; align-items:center; gap:8px; justify-content:center; }
+        .new-chat-btn:hover { background:#171717; }
+        .history-list { flex:1; overflow-y:auto; }
+        .history-item { padding:10px 12px; border-radius:8px; cursor:pointer; font-size:0.85rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-bottom:4px; color:var(--text-dim); }
+        .history-item:hover { background:#171717; color:white; }
+        #main { flex:1; display:flex; flex-direction:column; position:relative; }
+        .header { padding:16px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; }
+        .header h2 { font-size:0.9rem; font-weight:600; color:var(--text-dim); }
+        #chat-container { flex:1; overflow-y:auto; padding:40px 15%; display:flex; flex-direction:column; gap:32px; }
+        .message-row { display:flex; gap:20px; animation:fadeIn 0.3s ease-out; }
+        @keyframes fadeIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+        .avatar { width:32px; height:32px; border-radius:6px; flex-shrink:0; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:12px; }
+        .user-avatar { background:#ef4444; color:white; }
+        .ai-avatar { background:#10b981; color:white; }
+        .message-content { flex:1; line-height:1.6; font-size:1.05rem; }
+        .input-wrapper { padding:20px 15%; background:var(--main-bg); }
+        .input-container { background:#171717; border:1px solid var(--border); border-radius:12px; padding:12px 16px; display:flex; align-items:flex-end; gap:12px; box-shadow:0 4px 12px rgba(0,0,0,0.4); }
+        textarea { flex:1; background:transparent; border:none; color:white; outline:none; resize:none; padding:4px; font-size:1rem; max-height:200px; }
+        .icon-btn { cursor:pointer; color:var(--text-dim); transition:0.2s; padding:4px; }
+        .icon-btn:hover { color:white; }
+        #preview-box { display:none; margin-bottom:10px; width:60px; height:60px; position:relative; }
+        #preview-box img { width:100%; height:100%; object-fit:cover; border-radius:6px; }
+        .remove-img { position:absolute; top:-8px; right:-8px; background:white; color:black; border-radius:50%; width:16px; height:16px; font-size:10px; display:flex; align-items:center; justify-content:center; cursor:pointer; }
+        .loading-dots { display:none; font-size:12px; color:var(--text-dim); margin-bottom:8px; }
     </style>
 </head>
 <body>
-    <div class="app-container">
-        <div class="header"><h1>ANTIGRAVITY IQ | STABLE</h1></div>
-        <div class="chat-box" id="chatBox"><div class="message ai-message">Xin chào! Hệ thống Stable IQ đã sẵn sàng để phục vụ bạn.</div></div>
-        <div class="input-area">
-            <img id="preview" src="">
-            <div id="loader" class="loading">Đang phân tích xử lý...</div>
-            <form id="chatForm" class="form-container">
-                <input type="file" id="imageInput" accept="image/*" style="display:none" onchange="previewFile()">
-                <div class="upload-trigger" onclick="document.getElementById('imageInput').click()">📷</div>
-                <input type="text" id="messageInput" placeholder="Nhập câu hỏi tại đây..." autocomplete="off">
-                <button type="submit" class="send-btn" id="sendBtn">GỬI</button>
-            </form>
+    <div id="sidebar">
+        <div class="new-chat-btn" onclick="startNewChat()">+ New Chat</div>
+        <div class="history-list" id="historyList"></div>
+    </div>
+    <div id="main">
+        <div class="header"><h2>Antigravity Agent</h2><div style="font-size:11px;color:#10b981">● Connected</div></div>
+        <div id="chat-container"></div>
+        <div class="input-wrapper">
+            <div id="preview-box"><img id="preview-img"><div class="remove-img" onclick="clearImage()">×</div></div>
+            <div class="loading-dots" id="loader">Đang xử lý qua Vision Service...</div>
+            <div class="input-container">
+                <label class="icon-btn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg><input type="file" id="imageInput" style="display:none" onchange="previewFile()"></label>
+                <textarea id="messageInput" placeholder="Hỏi tôi về bất cứ điều gì..." rows="1" oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
+                <button class="icon-btn" style="border:none;background:transparent" onclick="sendMessage()"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polyline points="22 2 15 22 11 13 2 9 22 2"/></svg></button>
+            </div>
         </div>
     </div>
     <script>
-        const chatBox = document.getElementById('chatBox');
-        const chatForm = document.getElementById('chatForm');
+        const chatContainer = document.getElementById('chat-container');
         const messageInput = document.getElementById('messageInput');
         const imageInput = document.getElementById('imageInput');
-        const preview = document.getElementById('preview');
         const loader = document.getElementById('loader');
+        let currentMessages = [];
 
-        function previewFile() { const file = imageInput.files[0]; if(file) { const reader = new FileReader(); reader.onload=(e)=>{preview.src=e.target.result; preview.style.display='block';}; reader.readAsDataURL(file); } }
+        function previewFile() { const file=imageInput.files[0]; if(file) { const r=new FileReader(); r.onload=(e)=>{document.getElementById('preview-img').src=e.target.result; document.getElementById('preview-box').style.display='block';}; r.readAsDataURL(file); } }
+        function clearImage() { imageInput.value=''; document.getElementById('preview-box').style.display='none'; }
+        
+        function addMessageRow(text, role) {
+            const row=document.createElement('div'); row.className='message-row';
+            const ava=document.createElement('div'); ava.className=`avatar ${role==='ai'?'ai-avatar':'user-avatar'}`; ava.innerText=role==='ai'?'AI':'U';
+            const cont=document.createElement('div'); cont.className='message-content';
+            if(role==='ai') cont.innerHTML=marked.parse(text); else cont.innerText=text;
+            row.appendChild(ava); row.appendChild(cont); chatContainer.appendChild(row); chatContainer.scrollTo(0, chatContainer.scrollHeight);
+        }
 
-        chatForm.onsubmit = async (e) => {
-            e.preventDefault();
-            const msg = messageInput.value;
-            const file = imageInput.files[0];
+        async function sendMessage() {
+            const msg=messageInput.value.trim(); const file=imageInput.files[0];
             if(!msg && !file) return;
-
-            // Render User message
-            const userDiv = document.createElement('div'); userDiv.className='message user-message'; userDiv.innerText=msg || "Phân tích ảnh"; chatBox.appendChild(userDiv);
-            
-            // Clear input & Reset preview
-            messageInput.value=''; preview.style.display='none'; loader.style.display='block';
-            document.getElementById('sendBtn').disabled = true;
-
-            const fd = new FormData();
-            fd.append('message', msg); if(file) fd.append('image', file);
-            imageInput.value='';
-
+            addMessageRow(msg || "[Ảnh]", 'user');
+            messageInput.value=''; messageInput.style.height='auto'; clearImage(); loader.style.display='block';
+            const fd=new FormData(); fd.append('message', msg); if(file) fd.append('image', file);
             try {
-                const res = await fetch('/chat', { method: 'POST', body: fd });
-                const data = await res.json();
-                const aiDiv = document.createElement('div'); aiDiv.className='message ai-message'; 
-                aiDiv.innerHTML = marked.parse(data.response);
-                chatBox.appendChild(aiDiv);
-            } catch (err) {
-                alert("Lỗi: " + err.message);
-            } finally {
-                loader.style.display='none';
-                document.getElementById('sendBtn').disabled = false;
-                chatBox.scrollTo(0, chatBox.scrollHeight);
-            }
-        };
+                const res=await fetch('/chat', {method:'POST', body:fd});
+                const data=await res.json(); addMessageRow(data.response, 'ai');
+            } catch(e) { addMessageRow("❌ Lỗi: "+e.message, 'ai'); } finally { loader.style.display='none'; }
+        }
+
+        function startNewChat() { chatContainer.innerHTML=''; addMessageRow("Hệ thống **Multi-Service Vision** đã sẵn sàng.", 'ai'); }
+        startNewChat();
+        messageInput.addEventListener('keydown', (e)=>{if(e.key==='Enter' && !e.shiftKey){e.preventDefault(); sendMessage();}});
     </script>
 </body>
 </html>
@@ -197,18 +163,12 @@ async def get_index(): return HTML_CONTENT
 
 @app.post("/chat")
 async def chat_endpoint(message: str = Form(""), image: UploadFile = File(None)):
-    temp_path = None
-    if image and image.filename:
-        temp_path = os.path.join(TEMP_DIR, image.filename)
-        with open(temp_path, "wb") as f: shutil.copyfileobj(image.file, f)
-    
     try:
-        response_text = agent.chat_logic(message, temp_path)
+        # Agent xử lý việc gọi sang Vision và biên tập
+        response_text = agent.chat_logic(message, image)
         return {"response": response_text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if temp_path and os.path.exists(temp_path): os.remove(temp_path)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

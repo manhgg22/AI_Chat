@@ -19,32 +19,26 @@ class VisionProcessor:
 
     def process_image(self, image_path: str, user_prompt: str) -> Dict:
         """
-        Extract structured data from image.
+        Extract structured data from image using the user-specified scout model.
         """
-        print(f"[VISION PROCESSOR] Extracting structured data for: {image_path}")
+        print(f"[VISION PROCESSOR] Extracting structured data for: {image_path}", flush=True)
         
         base64_image = self._encode_image(image_path)
         
-        # SYSTEM PROMPT FOR STRUCTURED EXTRACTION
+        # SYSTEM PROMPT FOR DETAILED SCOUT ANALYSIS
         structured_prompt = f"""
-        Analyze the image and provide a structured JSON response. 
-        Focus on:
-        1. Context Category: (Document, Scene, Product, Text, Face, etc.)
-        2. Detailed Items: List of objects/elements detected.
-        3. OCR: Exact text found in the image.
-        4. Technical attributes: Colors, lighting, resolution feel.
-        5. Confidence Score: (0-1.0) based on how clear the image is.
+        Analyze this image in detail and provide a structured JSON response.
         
         User's specific interest: {user_prompt}
         
-        Return EXCLUSIVELY a JSON object with this keys: 
+        Return EXCLUSIVELY a JSON object with these keys: 
         {{
             "category": "string",
-            "detected_elements": ["list"],
+            "detected_elements": ["list of objects/features"],
             "ocr_content": "string",
-            "visual_description": "string",
-            "confidence": float,
-            "warning": "string if confidence < 0.7 else ''"
+            "visual_description": "detailed description",
+            "confidence": float (0.0-1.0),
+            "warning": "string"
         }}
         """
 
@@ -67,6 +61,7 @@ class VisionProcessor:
                 response_format={"type": "json_object"}
             )
             raw_result = completion.choices[0].message.content
+            print(f"[VISION PROCESSOR] Raw result: {raw_result}", flush=True)
             return json.loads(raw_result)
         except Exception as e:
             print(f"[VISION PROCESSOR] Error: {e}")

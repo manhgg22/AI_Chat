@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from groq import Groq
 from dotenv import load_dotenv
 from vision_processor import VisionProcessor
@@ -14,35 +14,54 @@ class ProfessionalAgent:
         self.model = model
         self.vision_processor = VisionProcessor()
 
-    def generate_final_response(self, user_query: str, image_path: Optional[str] = None) -> str:
+    def generate_final_response(self, user_query: str, image_paths: Optional[List[str]] = None) -> str:
         """
         Orchestrate the vision-only professional pipeline.
         """
-        if not image_path:
+        if not image_paths:
             # Simple text response for general queries
             return self._simple_chat(user_query)
 
         # 1. Vision Layer: Structured Extraction
-        print("[AGENT] Activating Vision Layer...")
-        vision_data = self.vision_processor.process_image(image_path, user_query)
+        print(f"[AGENT] Activating Vision Layer for {len(image_paths)} images...", flush=True)
+        aggregated_vision_data = []
+        total_confidence = 0
+        
+        for idx, path in enumerate(image_paths):
+            print(f"[AGENT] Processing Image {idx+1}/{len(image_paths)}...", flush=True)
+            vision_data = self.vision_processor.process_image(path, user_query)
+            aggregated_vision_data.append({
+                "image_index": idx + 1,
+                "data": vision_data
+            })
+            total_confidence += vision_data.get('confidence', 0)
+        
+        avg_confidence = total_confidence / len(image_paths)
         
         # 2. Intelligence Layer: Post-processing and Formatting
-        print("[AGENT] Activating Intelligence Layer (Post-processing)...")
+        print("[AGENT] Activating Intelligence Layer (Post-processing)...", flush=True)
         
         system_prompt = f"""
-        Bạn là Chuyên gia Phân tích Hình ảnh. Nhiệm vụ của bạn là nhận dữ liệu trích xuất từ Vision Model (JSON) và trình bày lại cho người dùng theo yêu cầu của họ.
+        Bạn là Thẩm phán Phân tích Hình ảnh Tối cao.
         
-        QUY TẮC:
-        1. Trình bày bằng tiếng Việt chuyên nghiệp, rõ ràng.
-        2. Nếu độ tin cậy (confidence) thấp (<0.7), PHẢI đưa ra lời cảnh báo (Warning).
-        3. Phân biệt rõ các phần: Quan sát chính, Nội dung văn bản (nếu có), và Kết luận.
-        4. Trả lời trực tiếp vào câu hỏi người dùng: "{user_query}"
+        BỐI CẢNH: Bạn nhận được dữ liệu từ Vision Model cho {len(image_paths)} hình ảnh. 
+        CÂU HỎI: "{user_query}"
+        
+        CHỈ THỊ BẮT BUỘC (QUYẾT ĐỊNH VẬN MỆNH):
+        1. TUYỆT ĐỐI KHÔNG được trả lời mập mờ, nước đôi hoặc dùng các cụm từ như "không thể xác định", "có vẻ như", "dường như", "có khả năng".
+        2. Bạn PHẢI đưa ra phán quyết CUỐI CÙNG: "ĐÚNG/CÓ" hoặc "SAI/KHÔNG". 
+        3. Dựa trên dữ liệu JSON, hãy tìm ra những điểm tương đồng hoặc khác biệt dù là nhỏ nhất để đưa ra lựa chọn có xác suất cao nhất. 
+        4. Sau khi chốt kết luận (ví dụ: "KẾT LUẬN: ĐÂY LÀ CÙNG MỘT NGƯỜI"), hãy liệt kê các bằng chứng kỹ thuật từ dữ liệu (ví dụ: cấu trúc khuôn mặt, OCR, đặc điểm nhận dạng) để bảo vệ phán quyết của mình.
+        5. Nếu độ tin cậy của dữ liệu thấp, bạn vẫn phải chọn một bên có lý nhất và khẳng định nó, kèm theo một lời cảnh báo kỹ thuật rất ngắn ở cuối.
+        
+        Hãy nhớ: Người dùng cần một câu trả lời dứt khoát để hành động. Đừng làm họ thất vọng bằng sự do dự!
         """
         
         context_payload = f"""
-        DỮ LIỆU TỪ VISION MODEL:
-        {json.dumps(vision_data, indent=2, ensure_ascii=False)}
+        DỮ LIỆU TỔNG HỢP TỪ VISION MODEL ({len(image_paths)} ảnh):
+        {json.dumps(aggregated_vision_data, indent=2, ensure_ascii=False)}
         """
+        print(f"[AGENT] Context Payload for Intelligence Layer:\n{context_payload}", flush=True)
 
         try:
             completion = self.client.chat.completions.create(
@@ -61,10 +80,10 @@ class ProfessionalAgent:
             response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
             
             # Append Confidence Badge
-            confidence_val = vision_data.get('confidence', 0) * 100
-            badge = f"\n\n---\n**Độ tin cậy của hệ thống:** {confidence_val}%"
-            if confidence_val < 70:
-                badge += f"\n⚠ **Cảnh báo:** {vision_data.get('warning', 'Kết quả có thể chưa hoàn toàn chính xác.')}"
+            confidence_pct = avg_confidence * 100
+            badge = f"\n\n---\n**Độ tin cậy hệ thống (trung bình):** {confidence_pct:.1f}%"
+            if avg_confidence < 0.7:
+                badge += f"\n⚠ **Cảnh báo:** Kết quả tổng hợp có thể chưa hoàn toàn chính xác do chất lượng ảnh đầu vào."
             
             return response + badge
 
@@ -86,6 +105,10 @@ class ProfessionalAgent:
             return re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
         except Exception as e:
             return f"Lỗi kết nối API: {str(e)}"
+
+    def chat(self, user_query: str, image_paths: Optional[List[str]] = None) -> str:
+        """Alias for generate_final_response to maintain compatibility."""
+        return self.generate_final_response(user_query, image_paths)
 
 # Alias to maintain compatibility with existing chat_server.py
 ChatAgent = ProfessionalAgent
